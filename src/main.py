@@ -1,495 +1,389 @@
-import os
+"""
+FAST BLOCKING V2 - RECALL EVALUATOR (Memory & CPU Optimized)
+Unstop 2026 Business Entity Resolution challenge.
+"""
+
+import argparse
+import gc
+import itertools
 import re
-import unicodedata
-from collections import defaultdict, Counter
 import time
-import ctypes
+import unicodedata
+from collections import Counter, defaultdict
+from pathlib import Path
 
-import pandas as pd
 import numpy as np
-from rapidfuzz import fuzz
+import pandas as pd
 
-BENCHMARK_ROWS = None
+SEED = 42
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TEST_DIR = os.path.join(ROOT, "dataset", "test")
-OUTPUT_DIR = os.path.join(ROOT, "output")
-
-STRICT_MATCH_THRESHOLD = 0.88
-MARGIN_THRESHOLD = 0.05
-MAX_TOKEN_POSTINGS = 100
-
-RARE_NAME_THRESHOLD = 3
-RARE_ADDRESS_THRESHOLD = 3
-
+LEGAL_SUFFIXES = {
+    "inc", "incorporated", "corp", "corporation", "llc", "ltd", "limited",
+    "pvt", "private", "co", "company", "services", "solutions",
+    "enterprises", "group", "holdings", "gmbh", "sarl", "sa", "pty", "plc",
+    "llp", "lp"
+}
 STOPWORDS = {
-    "inc", "llc", "ltd", "limited", "corp", "corporation", "company", "co",
-    "street", "st", "road", "rd", "avenue", "ave", "lane", "ln", "boulevard",
-    "blvd", "india", "usa", "france", "us", "uk", "private", "pvt"
+    "the", "of", "and", "in", "at", "on", "for", "by", "with", "a", "an",
+    "to", "from", "as", "is", "center", "centre", "plaza", "mall", "shop",
+    "store", "express", "global", "national", "international"
+}
+ADDR_ABBR = {
+    "st": "street", "rd": "road", "ave": "avenue", "av": "avenue",
+    "blvd": "boulevard", "ln": "lane", "dr": "drive", "ste": "suite",
+    "apt": "apartment", "fl": "floor", "flr": "floor", "pkwy": "parkway",
+    "hwy": "highway", "ct": "court", "pl": "place", "sq": "square"
 }
 
-def get_memory_usage_mb():
-    try:
-        import psutil
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / (1024 * 1024)
-    except ImportError:
-        if os.name == 'nt':
-            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-                _fields_ = [
-                    ("cb", ctypes.c_uint32),
-                    ("PageFaultCount", ctypes.c_uint32),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                ]
-            process_handle = ctypes.windll.kernel32.GetCurrentProcess()
-            memory_counters = PROCESS_MEMORY_COUNTERS()
-            ctypes.windll.psapi.GetProcessMemoryInfo(process_handle, ctypes.byref(memory_counters), ctypes.sizeof(memory_counters))
-            return memory_counters.WorkingSetSize / (1024 * 1024)
-        return 0.0
+# --- Optimized Normalization ---
 
-def normalize_text(value):
-    if pd.isna(value) or not value:
-        return ""
-    text = unicodedata.normalize("NFKD", str(value))
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+PUNCT_RE = re.compile(r"[^a-z0-9\s]")
+SPACE_RE = re.compile(r"\s+")
+NUM_RE = re.compile(r"\b\d+\b")
 
-def tokenize(text):
-    return set(text.split())
+def clean_text(x):
+    if not x or pd.isna(x): return ""
+    s = unicodedata.normalize("NFKD", str(x)).encode('ascii', 'ignore').decode('utf-8')
+    s = s.lower().replace("&", " and ")
+    s = PUNCT_RE.sub(" ", s)
+    return SPACE_RE.sub(" ", s).strip()
 
-def jaccard_similarity(text_a, text_b):
-    a = tokenize(text_a)
-    b = tokenize(text_b)
-    if not a and not b: return 1.0
-    if not a or not b: return 0.0
-    return len(a & b) / len(a | b)
+def norm_name(x):
+    s = clean_text(x)
+    if not s: return ""
+    toks = [t for t in s.split() if t not in LEGAL_SUFFIXES]
+    return " ".join(toks) if toks else s
 
-def calculate_score(name1, name2, address1, address2):
-    name_ratio = fuzz.ratio(name1, name2) / 100.0
-    name_token_ratio = fuzz.token_set_ratio(name1, name2) / 100.0
-    name_partial_ratio = fuzz.partial_ratio(name1, name2) / 100.0
-    
-    address_ratio = fuzz.ratio(address1, address2) / 100.0
-    address_token_ratio = fuzz.token_set_ratio(address1, address2) / 100.0
-    
-    name_jaccard = jaccard_similarity(name1, name2)
-    address_jaccard = jaccard_similarity(address1, address2)
-    
-    score = (
-        0.35 * name_token_ratio
-        + 0.20 * name_ratio
-        + 0.10 * name_partial_ratio
-        + 0.15 * address_ratio
-        + 0.10 * address_token_ratio
-        + 0.05 * name_jaccard
-        + 0.05 * address_jaccard
-    )
-    return score
+def norm_addr(x):
+    s = clean_text(x)
+    if not s: return ""
+    return " ".join(ADDR_ABBR.get(t, t) for t in s.split())
 
-def load_and_index_pool():
-    print(f"[{get_memory_usage_mb():.1f} MB] Loading S2 and S3...")
-    s2_path = os.path.join(TEST_DIR, "test_source2.tsv")
-    s3_path = os.path.join(TEST_DIR, "test_source3.tsv")
-    
-    pool_data = defaultdict(lambda: {"entity_ids": [], "names": [], "addresses": []})
-    
-    for path in [s2_path, s3_path]:
-        print(f"Reading {os.path.basename(path)}...")
-        chunk_iter = pd.read_csv(
-            path, 
-            sep="\t", 
-            chunksize=100000, 
-            usecols=["entity_id", "business_name", "business_address", "country"],
-            dtype=str
-        )
-        for chunk in chunk_iter:
-            chunk["name_norm"] = chunk["business_name"].apply(normalize_text)
-            chunk["address_norm"] = chunk["business_address"].apply(normalize_text)
+def norm_country(x):
+    s = str(x).strip().upper() if x is not None else ""
+    return {
+        "USA": "US", "UNITED STATES": "US", "UNITED STATES OF AMERICA": "US",
+        "IND": "IN", "INDIA": "IN", "FRA": "FR", "FRANCE": "FR"
+    }.get(s, s or "UN")
+
+
+# --- Fast Inverted Index V2 (Early Pruning) ---
+
+B_NAME = 1
+B_ADDR = 2
+B_RARE = 3
+B_PAIR = 4
+B_NUM  = 5
+B_SIG  = 6
+
+BUCKET_NAMES = {
+    B_NAME: "Exact-name",
+    B_ADDR: "Exact-address",
+    B_RARE: "Rare-token",
+    B_PAIR: "Token-pair/trigram",
+    B_NUM:  "Number+name",
+    B_SIG:  "Character-signature"
+}
+
+# Caps array allows ultra-fast O(1) lookup during inner loop based on Bucket ID
+# Format: (Pad, Name, Addr, Rare, Pair, Num, Sig)
+CAPS = (0, 2000, 2000, 500, 800, 800, 200)
+
+class FastIndexV2:
+    def __init__(self, pool):
+        self.ids = pool["entity_id"].to_numpy()
+        self.names = pool["clean_name"].to_numpy()
+        self.addrs = pool["clean_addr"].to_numpy()
+        self.countries = pool["clean_country"].to_numpy()
+        self.n = len(pool)
+        self.id_to_idx = {x: i for i, x in enumerate(self.ids)}
+        
+        self.rare_vocab = set()
+        self.index = {}
+        self._build()
+
+    def _build(self):
+        print(f"[Index] Scanning {self.n:,} records for rare vocab...")
+        t0 = time.time()
+        
+        df = Counter()
+        for name in self.names:
+            if not name: continue
+            for t in set(name.split()):
+                if len(t) >= 3 and t not in STOPWORDS and t not in LEGAL_SUFFIXES:
+                    df[t] += 1
+        
+        self.rare_vocab = {t for t, c in df.items() if 2 <= c <= 150}
+        del df
+        print(f"[Index] Found {len(self.rare_vocab):,} rare tokens.")
+
+        print("[Index] Extracting keys with Early-Pruning (Memory Safe)...")
+        raw_idx = {}
+        
+        # Local refs for extreme speed inside the 10M loop
+        names = self.names
+        addrs = self.addrs
+        countries = self.countries
+        rare = self.rare_vocab
+        
+        for i in range(self.n):
+            c = countries[i]
+            n = names[i]
+            a = addrs[i]
             
-            for row in chunk.itertuples(index=False):
-                if pd.isna(row.country):
-                    continue
-                c = row.country
-                pool_data[c]["entity_ids"].append(row.entity_id)
-                pool_data[c]["names"].append(row.name_norm)
-                pool_data[c]["addresses"].append(row.address_norm)
-
-    print(f"[{get_memory_usage_mb():.1f} MB] Building indexes per country...")
-    
-    country_indexes = {}
-    for c, data in pool_data.items():
-        name_index = defaultdict(list)
-        address_index = defaultdict(list)
-        token_index = defaultdict(list)
-        prefix_index = defaultdict(list)
-        token_frequency = Counter()
-        prefix_frequency = Counter()
-        
-        names = data["names"]
-        addresses = data["addresses"]
-        
-        for name in names:
-            tokens = set(name.split())
-            for t in tokens:
-                if len(t) >= 3 and t not in STOPWORDS:
-                    token_frequency[t] += 1
-            if len(name) >= 6:
-                prefix_frequency[name[:6]] += 1
+            keys = set()
+            
+            nt = []
+            if n:
+                keys.add((B_NAME, c, n))
+                nt = [t for t in n.split() if t not in STOPWORDS and t not in LEGAL_SUFFIXES]
                 
-        for idx, name in enumerate(names):
-            if len(name) >= 4:
-                name_index[name].append(idx)
+            at = []
+            if a:
+                keys.add((B_ADDR, c, a))
+                at = [t for t in a.split() if t not in STOPWORDS and t not in LEGAL_SUFFIXES]
                 
-            tokens = set(name.split())
-            for t in tokens:
-                if len(t) >= 3 and t not in STOPWORDS:
-                    if token_frequency[t] <= MAX_TOKEN_POSTINGS:
-                        token_index[t].append(idx)
-                        
-            if len(name) >= 6:
-                p = name[:6]
-                if prefix_frequency[p] <= MAX_TOKEN_POSTINGS:
-                    prefix_index[p].append(idx)
+            for t in nt:
+                if t in rare:
+                    keys.add((B_RARE, c, t))
+            
+            if len(nt) >= 2:
+                for p in itertools.combinations(nt[:4], 2):
+                    keys.add((B_PAIR, c, p[0], p[1]))
+            if len(nt) >= 3:
+                for p in itertools.combinations(nt[:4], 3):
+                    keys.add((B_PAIR, c, p[0], p[1], p[2]))
                     
-        for idx, address in enumerate(addresses):
-            if len(address) >= 8:
-                address_index[address].append(idx)
+            if a:
+                nu = set(NUM_RE.findall(a))
+                for num in nu:
+                    for t in nt[:3]:
+                        keys.add((B_NUM, c, num, t))
+                    for t in at[:2]:
+                        keys.add((B_NUM, c, num, t))
+                        
+            if n:
+                n_ns = n.replace(" ", "")
+                l = len(n_ns)
+                if l >= 5:
+                    keys.add((B_SIG, c, "pre5", n_ns[:5]))
+                if l >= 7:
+                    keys.add((B_SIG, c, "pre7", n_ns[:7]))
+                    keys.add((B_SIG, c, "suf5", n_ns[-5:]))
                 
-        country_indexes[c] = {
-            "name_index": dict(name_index),
-            "address_index": dict(address_index),
-            "token_index": dict(token_index),
-            "prefix_index": dict(prefix_index),
-            "token_frequency": dict(token_frequency)
-        }
+                if nt:
+                    first = nt[0]
+                    keys.add((B_SIG, c, "ftok", first))
+                    sig = "".join(sorted(set(first)))
+                    if len(sig) >= 4:
+                        keys.add((B_SIG, c, "fsig", sig))
+
+            # EARLY PRUNING: Insert safely, blacklist immediately if cap exceeded
+            for k in keys:
+                val = raw_idx.get(k)
+                if val is None:
+                    raw_idx[k] = [i]
+                elif val is not True:  # True = Blacklisted/Cap exceeded
+                    val.append(i)
+                    if len(val) > CAPS[k[0]]:
+                        raw_idx[k] = True  # Instantly free memory!
+                        
+            if (i + 1) % 1_000_000 == 0:
+                print(f"    Indexed {i + 1:,} / {self.n:,} rows...")
+                
+        print("[Index] Finalizing index and purging blacklisted keys...")
+        # Strip all the 'True' values out, keeping only valid lists
+        self.index = {k: v for k, v in raw_idx.items() if v is not True}
+            
+        del raw_idx
+        gc.collect()
+        print(f"[Index] Built in {time.time()-t0:.1f}s | Valid keys: {len(self.index):,}")
+
+    def get_candidates(self, row):
+        c = row["clean_country"]
+        n = row["clean_name"]
+        a = row["clean_addr"]
         
-    print(f"[{get_memory_usage_mb():.1f} MB] Pool loading and indexing complete.")
-    return pool_data, country_indexes
+        keys = set()
+        nt = []
+        if n:
+            keys.add((B_NAME, c, n))
+            nt = [t for t in n.split() if t not in STOPWORDS and t not in LEGAL_SUFFIXES]
+            
+        at = []
+        if a:
+            keys.add((B_ADDR, c, a))
+            at = [t for t in a.split() if t not in STOPWORDS and t not in LEGAL_SUFFIXES]
+            
+        for t in nt:
+            if t in self.rare_vocab:
+                keys.add((B_RARE, c, t))
+        
+        if len(nt) >= 2:
+            for p in itertools.combinations(nt[:4], 2): keys.add((B_PAIR, c, p[0], p[1]))
+        if len(nt) >= 3:
+            for p in itertools.combinations(nt[:4], 3): keys.add((B_PAIR, c, p[0], p[1], p[2]))
+                
+        if a:
+            nu = set(NUM_RE.findall(a))
+            for num in nu:
+                for t in nt[:3]: keys.add((B_NUM, c, num, t))
+                for t in at[:2]: keys.add((B_NUM, c, num, t))
+                    
+        if n:
+            n_ns = n.replace(" ", "")
+            l = len(n_ns)
+            if l >= 5: keys.add((B_SIG, c, "pre5", n_ns[:5]))
+            if l >= 7:
+                keys.add((B_SIG, c, "pre7", n_ns[:7]))
+                keys.add((B_SIG, c, "suf5", n_ns[-5:]))
+            if nt:
+                first = nt[0]
+                keys.add((B_SIG, c, "ftok", first))
+                sig = "".join(sorted(set(first)))
+                if len(sig) >= 4: keys.add((B_SIG, c, "fsig", sig))
 
-def generate_candidates(s1_name, s1_address, indexes):
-    candidates = set()
+        found = defaultdict(set)
+        for k in keys:
+            bucket = k[0]
+            for pool_idx in self.index.get(k, []):
+                found[pool_idx].add(bucket)
+                
+        return found
+
+
+# --- Evaluation Runner ---
+
+def load_and_clean_chunked(file_path, keep_raw=False):
+    cols = ["entity_id", "business_name", "business_address", "country"]
+    processed = []
+    chunk_idx = 1
     
-    name_index = indexes["name_index"]
-    address_index = indexes["address_index"]
-    token_index = indexes["token_index"]
-    prefix_index = indexes["prefix_index"]
-    token_frequency = indexes["token_frequency"]
-    
-    if len(s1_name) >= 4:
-        cands = name_index.get(s1_name, [])
-        if len(cands) <= MAX_TOKEN_POSTINGS:
-            candidates.update(cands)
+    for chunk in pd.read_csv(file_path, sep="\t", dtype=str, usecols=cols, chunksize=500_000):
+        chunk = chunk.fillna("")
+        chunk["clean_name"] = chunk["business_name"].map(norm_name)
+        chunk["clean_addr"] = chunk["business_address"].map(norm_addr)
+        chunk["clean_country"] = chunk["country"].map(norm_country)
+        
+        if not keep_raw:
+            chunk.drop(columns=["business_name", "business_address", "country"], inplace=True)
             
-    if len(s1_address) >= 8:
-        cands = address_index.get(s1_address, [])
-        if len(cands) <= MAX_TOKEN_POSTINGS:
-            candidates.update(cands)
-            
-    if len(s1_name) >= 6:
-        p = s1_name[:6]
-        cands = prefix_index.get(p, [])
-        if len(cands) <= min(MAX_TOKEN_POSTINGS, 100):
-            candidates.update(cands)
-            
-    tokens = [t for t in set(s1_name.split()) if len(t) >= 3 and t not in STOPWORDS and t in token_index]
-    tokens.sort(key=lambda t: token_frequency.get(t, 0))
-    
-    if tokens:
-        t = tokens[0]
-        cands = token_index.get(t, [])
-        if len(cands) <= MAX_TOKEN_POSTINGS:
-            candidates.update(cands)
-            
-    return candidates
+        processed.append(chunk)
+        print(f"    Loaded & cleaned chunk {chunk_idx} (500k rows)...")
+        chunk_idx += 1
+        gc.collect()
+        
+    return pd.concat(processed, ignore_index=True)
 
-def count_data_rows(path):
-    """Count data rows in an existing TSV without loading it into memory."""
-    if not os.path.exists(path):
-        return 0
-    with open(path, "rb") as f:
-        lines = sum(1 for _ in f)
-    return max(0, lines - 1)
-
-
-def process_s1():
-    pool_data, country_indexes = load_and_index_pool()
-
-    s1_path = os.path.join(TEST_DIR, "test_source1.tsv")
-    candidate_path = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
-    matching_path = os.path.join(OUTPUT_DIR, "matching_results.tsv")
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # Resume automatically from the number of complete data rows already
-    # present in BOTH output files. This preserves the first part of the
-    # previous run instead of overwriting it.
-    existing_candidate_rows = count_data_rows(candidate_path)
-    existing_matching_rows = count_data_rows(matching_path)
-
-    if existing_candidate_rows != existing_matching_rows:
-        raise RuntimeError(
-            "Output files are out of sync: "
-            f"candidate_pairs.tsv has {existing_candidate_rows:,} data rows, "
-            f"matching_results.tsv has {existing_matching_rows:,} data rows."
-        )
-
-    total_s1_rows = count_data_rows(s1_path)
-    resume_rows = existing_candidate_rows
-
-    if resume_rows > total_s1_rows:
-        raise RuntimeError(
-            f"Existing output has {resume_rows:,} rows, but S1 has only "
-            f"{total_s1_rows:,} rows."
-        )
-
-    if resume_rows == total_s1_rows:
-        print("\nAll S1 rows are already processed.")
-        print(f"Rows processed: {total_s1_rows:,}/{total_s1_rows:,}")
-        print(f"Candidate file:\n{candidate_path}")
-        print(f"Matching file:\n{matching_path}")
-        return
-
-    print(
-        f"\nResuming S1 processing from row {resume_rows + 1:,} "
-        f"of {total_s1_rows:,}..."
-    )
-    print(f"Remaining rows: {total_s1_rows - resume_rows:,}")
-
-    chunk_size = 25000
-    rows_processed = resume_rows
-    newly_processed = 0
-
-    total_candidates_new = 0
-    max_candidates_new = 0
-    total_matches_new = 0
-    max_matches_new = 0
-    matched_s1_rows_new = 0
-
-    dist = {"0": 0, "1-5": 0, "6-10": 0, "11-20": 0, "21-50": 0, "51-100": 0, ">100": 0}
-
-    start_time = time.time()
-
-    # The file has a header. Skip the header + already processed data rows,
-    # then supply the known column names because the next line is data.
-    s1_columns = ["entity_id", "business_name", "business_address", "country"]
-    chunk_iter = pd.read_csv(
-        s1_path,
-        sep="\t",
-        chunksize=chunk_size,
-        skiprows=resume_rows + 1,
-        header=None,
-        names=s1_columns,
-        dtype=str,
-    )
-
-    append_mode = "a" if resume_rows > 0 else "w"
-
-    # Open once and append each completed chunk. This avoids repeatedly
-    # opening the files for every chunk.
-    with open(candidate_path, append_mode, encoding="utf-8") as fc, \
-         open(matching_path, append_mode, encoding="utf-8") as fm:
-
-        if resume_rows == 0:
-            fc.write("source1_entity_id\tcandidate_entity_ids\n")
-            fm.write("source1_entity_id\tmatched_entity_ids\n")
-
-        for chunk in chunk_iter:
-            chunk["name_norm"] = chunk["business_name"].apply(normalize_text)
-            chunk["address_norm"] = chunk["business_address"].apply(normalize_text)
-
-            candidates_out = []
-            matches_out = []
-
-            for row in chunk.itertuples(index=False):
-                s1_id = row.entity_id
-                s1_name = row.name_norm
-                s1_address = row.address_norm
-                c = row.country if not pd.isna(row.country) else None
-
-                if c not in pool_data or c not in country_indexes:
-                    candidates_out.append(f"{s1_id}\t\n")
-                    matches_out.append(f"{s1_id}\t\n")
-                    continue
-
-                indexes = country_indexes[c]
-                c_data = pool_data[c]
-
-                name_index = indexes["name_index"]
-                address_index = indexes["address_index"]
-
-                candidate_indices = generate_candidates(
-                    s1_name, s1_address, indexes
-                )
-
-                valid_candidates = []
-                pool_ids = c_data["entity_ids"]
-                pool_names = c_data["names"]
-                pool_addresses = c_data["addresses"]
-
-                for idx in candidate_indices:
-                    c_id = pool_ids[idx]
-                    if c_id.startswith("S2-") or c_id.startswith("S3-"):
-                        valid_candidates.append(idx)
-
-                candidate_ids = []
-                scored_candidates = []
-
-                for idx in valid_candidates:
-                    c_id = pool_ids[idx]
-                    candidate_ids.append(c_id)
-
-                    c_name = pool_names[idx]
-                    c_address = pool_addresses[idx]
-
-                    name_freq = len(name_index.get(c_name, []))
-                    addr_freq = len(address_index.get(c_address, []))
-
-                    exact_name = bool(s1_name) and s1_name == c_name
-                    exact_address = bool(s1_address) and s1_address == c_address
-
-                    strong_name = exact_name and name_freq <= RARE_NAME_THRESHOLD
-                    strong_addr = exact_address and addr_freq <= RARE_ADDRESS_THRESHOLD
-
-                    # Keep the original scoring logic exactly the same.
-                    score = calculate_score(
-                        s1_name, c_name, s1_address, c_address
-                    )
-
-                    scored_candidates.append(
-                        (c_id, score, strong_name, strong_addr)
-                    )
-
-                scored_candidates.sort(key=lambda x: x[1], reverse=True)
-
-                accepted_matches = []
-
-                if scored_candidates:
-                    best_score = scored_candidates[0][1]
-                    second_best_score = (
-                        scored_candidates[1][1]
-                        if len(scored_candidates) > 1
-                        else 0.0
-                    )
-                    margin = best_score - second_best_score
-
-                    for i, c_info in enumerate(scored_candidates):
-                        c_id, score, strong_name, strong_addr = c_info
-                        strong_evidence = strong_name or strong_addr
-
-                        if strong_evidence:
-                            accepted_matches.append(c_id)
-                            continue
-
-                        if score >= STRICT_MATCH_THRESHOLD:
-                            if i == 0 and margin >= MARGIN_THRESHOLD:
-                                accepted_matches.append(c_id)
-
-                candidate_ids = list(dict.fromkeys(candidate_ids))
-                matched_ids = list(dict.fromkeys(accepted_matches))
-
-                candidate_count = len(candidate_ids)
-                match_count = len(matched_ids)
-
-                total_candidates_new += candidate_count
-                max_candidates_new = max(max_candidates_new, candidate_count)
-                total_matches_new += match_count
-                max_matches_new = max(max_matches_new, match_count)
-
-                if match_count:
-                    matched_s1_rows_new += 1
-
-                if match_count == 0:
-                    dist["0"] += 1
-                elif match_count <= 5:
-                    dist["1-5"] += 1
-                elif match_count <= 10:
-                    dist["6-10"] += 1
-                elif match_count <= 20:
-                    dist["11-20"] += 1
-                elif match_count <= 50:
-                    dist["21-50"] += 1
-                elif match_count <= 100:
-                    dist["51-100"] += 1
-                else:
-                    dist[">100"] += 1
-
-                candidates_out.append(
-                    f"{s1_id}\t{','.join(candidate_ids)}\n"
-                )
-                matches_out.append(
-                    f"{s1_id}\t{','.join(matched_ids)}\n"
-                )
-
-            fc.writelines(candidates_out)
-            fm.writelines(matches_out)
-            fc.flush()
-            fm.flush()
-
-            newly_processed += len(chunk)
-            rows_processed += len(chunk)
-
-            elapsed = time.time() - start_time
-            rate = newly_processed / elapsed if elapsed > 0 else 0.0
-            remaining = total_s1_rows - rows_processed
-            eta_seconds = remaining / rate if rate > 0 else 0.0
-
-            print(
-                f"Progress: {rows_processed:,}/{total_s1_rows:,} "
-                f"({rows_processed / total_s1_rows * 100:.1f}%) | "
-                f"Rate: {rate:,.0f} rows/s | "
-                f"ETA: {eta_seconds / 60:.1f} min",
-                flush=True,
-            )
-
-            if (
-                BENCHMARK_ROWS is not None
-                and newly_processed >= BENCHMARK_ROWS
-            ):
-                break
-
-    elapsed = time.time() - start_time
-
-    print("\n" + "=" * 60)
-    print("RESUME RUN DONE")
-    print("=" * 60)
-    print(f"Previously processed: {resume_rows:,}")
-    print(f"New rows processed: {newly_processed:,}")
-    print(f"Total rows processed: {rows_processed:,}/{total_s1_rows:,}")
-    print(f"Average candidates (new rows): {total_candidates_new / newly_processed:.2f}" if newly_processed else "Average candidates (new rows): 0.00")
-    print(f"Max candidates (new rows): {max_candidates_new:,}")
-    print(f"S1 rows with matches (new rows): {matched_s1_rows_new:,}")
-    print(f"Total final matches (new rows): {total_matches_new:,}")
-    print(f"Average final matches per S1 (new rows): {total_matches_new / newly_processed:.4f}" if newly_processed else "Average final matches per S1 (new rows): 0.0000")
-    print(f"Max matches (new rows): {max_matches_new:,}")
-
-    print("\nDistribution of final match counts (new rows):")
-    for k, v in dist.items():
-        print(f"  {k:8}: {v:,}")
-
-    print(f"\nElapsed time: {elapsed:.2f} seconds")
-    print(f"RAM usage: {get_memory_usage_mb():.1f} MB")
-    print(f"\nCandidate file:\n{candidate_path}")
-    print(f"Matching file:\n{matching_path}")
 
 def main():
-    print("=" * 60)
-    print("BUSINESS ENTITY RESOLUTION")
-    print("=" * 60)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset-dir", default="dataset")
+    ap.add_argument("--val-size", type=int, default=25000, help="S1 records to evaluate")
+    args = ap.parse_args()
+
+    t0 = time.time()
+    train_dir = Path(args.dataset_dir) / "train"
+
+    print("="*70)
+    print("FAST BLOCKING V2 - RECALL EVALUATOR (Memory Optimized)")
+    print("="*70)
+
+    print("\n[1/3] Loading and cleaning data in chunks...")
     
-    if BENCHMARK_ROWS is not None:
-        print(f"*** BENCHMARK MODE: Processing first {BENCHMARK_ROWS} S1 rows ***")
+    print("  -> Processing train_source1.tsv...")
+    s1 = load_and_clean_chunked(train_dir / "train_source1.tsv", keep_raw=True)
+    
+    print("  -> Processing train_source2.tsv (Pool)...")
+    s2 = load_and_clean_chunked(train_dir / "train_source2.tsv", keep_raw=False)
+    
+    s3_path = train_dir / "train_source3.tsv"
+    if s3_path.exists():
+        print("  -> Processing train_source3.tsv (Pool)...")
+        s3 = load_and_clean_chunked(s3_path, keep_raw=False)
+        pool = pd.concat([s2, s3], ignore_index=True)
+        del s3
+    else:
+        pool = s2
         
-    process_s1()
+    del s2
+    gc.collect()
+
+    print("  -> Loading ground truth...")
+    gt_df = pd.read_csv(train_dir / "train_ground_truth.tsv", sep="\t", dtype=str).fillna("")
+    gt = {}
+    for sid, matches in zip(gt_df["source1_entity_id"], gt_df["matched_entity_ids"]):
+        gt[sid] = {x for x in matches.split(",") if x}
+    del gt_df
+
+    print(f"\n[2/3] Initializing FastIndexV2 over {len(pool):,} records...")
+    index = FastIndexV2(pool)
+
+    # Sample a validation set containing actual matches
+    s1_with_matches = s1[s1["entity_id"].isin([k for k, v in gt.items() if v])].copy()
+    val_s1 = s1_with_matches.sample(n=min(args.val_size, len(s1_with_matches)), random_state=SEED)
+    
+    val_records = val_s1.to_dict('records')
+    print(f"\n[3/3] Evaluating blocking on {len(val_records):,} S1 validation records...")
+
+    total_true_links = 0
+    bucket_hits = {b: 0 for b in BUCKET_NAMES.keys()}
+    cumulative_hits = set()
+    cand_counts = []
+    
+    t_eval = time.time()
+    for i, row in enumerate(val_records):
+        sid = row["entity_id"]
+        t_ids = gt.get(sid, set())
+        t_indices = {index.id_to_idx[tid] for tid in t_ids if tid in index.id_to_idx}
+        
+        if not t_indices:
+            continue
+            
+        total_true_links += len(t_indices)
+        
+        cand_map = index.get_candidates(row)
+        cand_counts.append(len(cand_map))
+        
+        for t_idx in t_indices:
+            found_buckets = cand_map.get(t_idx, set())
+            for b in found_buckets:
+                bucket_hits[b] += 1
+            if found_buckets:
+                cumulative_hits.add((sid, t_idx))
+                
+        if (i + 1) % 5000 == 0:
+            print(f"  processed {i + 1:,} queries...")
+
+    print(f"Evaluation complete in {time.time()-t_eval:.1f}s.\n")
+
+    print("="*60)
+    print("BLOCKING V2 EVALUATION REPORT")
+    print("="*60)
+    
+    print(f"Total true links evaluated : {total_true_links:,}")
+    print("\n--- INDEPENDENT RECALL BY STRATEGY ---")
+    for b_id, b_name in sorted(BUCKET_NAMES.items()):
+        hits = bucket_hits[b_id]
+        rec = (hits / total_true_links) * 100 if total_true_links else 0
+        print(f"{b_id}. {b_name:<25} : {rec:>6.2f}% ({hits:,} hits)")
+
+    cum_recall = (len(cumulative_hits) / total_true_links) * 100 if total_true_links else 0
+    print("\n--- CUMULATIVE ---")
+    print(f"7. Cumulative union recall   : {cum_recall:>6.2f}% ({len(cumulative_hits):,}/{total_true_links:,})")
+
+    avg_cands = np.mean(cand_counts) if cand_counts else 0
+    p95 = np.percentile(cand_counts, 95) if cand_counts else 0
+    p99 = np.percentile(cand_counts, 99) if cand_counts else 0
+    max_cands = np.max(cand_counts) if cand_counts else 0
+
+    print("\n--- CANDIDATE SET SIZES (Before any ML Truncation) ---")
+    print(f"8. Average candidate count   : {avg_cands:,.2f}")
+    print(f"9. p95 candidate count       : {p95:,.0f}")
+    print(f"10. p99 candidate count      : {p99:,.0f}")
+    print(f"11. Maximum candidates       : {max_cands:,.0f}")
+    print("="*60)
+
 
 if __name__ == "__main__":
     main()

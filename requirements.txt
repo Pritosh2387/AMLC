@@ -1,6 +1,4 @@
 pandas
+numpy
 scikit-learn
 rapidfuzz
-numpy
-joblib
-scipy
